@@ -9,7 +9,7 @@ import { Client, Invoice, InvoiceItem, JournalEntry, Project } from '../models.j
 import { formatInr } from '../money.js';
 import { sendMail } from '../services/mail.js';
 import { invoicePdf } from '../services/pdf.js';
-import { issueInvoice, recordInvoiceReceipt, refreshOverdues, saveDraftInvoice, voidFinancial } from '../services/finance.js';
+import { dropSentPayment, issueInvoice, recordInvoiceReceipt, refreshOverdues, saveDraftInvoice, voidFinancial } from '../services/finance.js';
 import { getSettings } from '../settingsCache.js';
 import { invoiceBody, receiptBody } from './schemas.js';
 
@@ -70,12 +70,15 @@ router.patch('/:id/status', requirePerm('invoices.manage'), wrap(async (req, res
     const fresh = await Invoice.findById(invoice._id);
     fresh.status = 'draft';
     fresh.amountPaidPaise = 0;
+    fresh.sentAt = undefined;
     await fresh.save();
+    await dropSentPayment(fresh._id);
     recordAudit(req, { action: 'update', entityType: 'invoice', entityId: fresh._id, summary: `Set invoice ${fresh.number || fresh._id} to draft` });
     res.json({ data: fresh });
     return;
   }
   invoice.status = body.status;
+  if (['sent', 'partial', 'paid', 'overdue'].includes(body.status) && !invoice.sentAt) invoice.sentAt = new Date();
   if (body.status === 'paid') invoice.amountPaidPaise = invoice.totalPaise;
   if (body.status === 'sent' || body.status === 'overdue' || body.status === 'cancelled') {
     if (!invoice.receipts?.some((receipt) => !receipt.reversed)) invoice.amountPaidPaise = 0;
@@ -104,6 +107,7 @@ router.delete('/:id', requirePerm('invoices.manage'), wrap(async (req, res) => {
     const entry = await JournalEntry.findById(current.journalEntryId);
     if (entry?.status === 'posted') await voidFinancial(current.journalEntryId, req.user._id, 'Deleted invoice', today);
   }
+  await dropSentPayment(invoice._id);
   await InvoiceItem.deleteMany({ invoiceId: invoice._id });
   await Invoice.deleteOne({ _id: invoice._id });
   recordAudit(req, { action: 'delete', entityType: 'invoice', entityId: invoice._id, summary: `Deleted invoice ${invoice.number || invoice._id}` });

@@ -63,6 +63,50 @@ function invoiceStatus(invoice, today) {
   return 'sent';
 }
 
+async function mirrorSentInvoice(invoice, userId, session) {
+  if (!invoice.sentAt) invoice.sentAt = invoice.updatedAt || new Date();
+  if (!invoice.totalPaise) return null;
+  const query = ClientPayment.findOne({ invoiceId: invoice._id, voided: false });
+  if (session) query.session(session);
+  const existing = await query;
+  const today = todayKey((await getSettings()).timezone);
+  const received = invoice.amountPaidPaise || 0;
+  if (existing) {
+    if (!existing.sentAt) {
+      existing.sentAt = invoice.sentAt;
+      await existing.save(session ? { session } : undefined);
+    }
+    return existing;
+  }
+  const payload = {
+    clientId: invoice.clientId,
+    projectId: invoice.projectId,
+    invoiceId: invoice._id,
+    paymentType: invoice.number ? `Invoice ${invoice.number}` : 'Invoice',
+    periodKey: `invoice-${invoice._id}`,
+    invoiceAmountPaise: invoice.totalPaise,
+    amountReceivedPaise: received,
+    dueDate: invoice.dueDate || invoice.dateKey || '',
+    status: paymentStatus(invoice.totalPaise, received, invoice.dueDate, today),
+    sentAt: invoice.sentAt,
+    notes: invoice.number ? `Sent ${invoice.number}` : 'Sent invoice',
+    recordedBy: userId || invoice.createdBy,
+    voided: false,
+  };
+  if (session) {
+    const [doc] = await ClientPayment.create([payload], { session });
+    return doc;
+  }
+  return ClientPayment.create(payload);
+}
+
+export async function dropSentPayment(invoiceId) {
+  await ClientPayment.updateMany(
+    { invoiceId, voided: false, amountReceivedPaise: { $lte: 0 } },
+    { $set: { voided: true, status: 'void' } },
+  );
+}
+
 export async function refreshOverdues() {
   const today = todayKey((await getSettings()).timezone);
   await ClientPayment.updateMany(
@@ -73,6 +117,12 @@ export async function refreshOverdues() {
     { status: { $in: ['sent', 'partial'] }, dueDate: { $lt: today }, $expr: { $lt: ['$amountPaidPaise', '$totalPaise'] } },
     { $set: { status: 'overdue' } },
   );
+  const issued = await Invoice.find({ status: { $in: ['sent', 'partial', 'paid', 'overdue'] } });
+  for (const invoice of issued) {
+    const before = invoice.sentAt;
+    await mirrorSentInvoice(invoice);
+    if (!before) await invoice.save();
+  }
 }
 
 async function categoryAccount(session, kind, category) {
@@ -1124,7 +1174,9 @@ export function issueInvoice(invoiceId, userId) {
     invoice.journalEntryId = posted.entry._id;
     invoice.paymentInstructions = invoice.paymentInstructions || settings.paymentInstructions || '';
     const today = todayKey(settings.timezone);
+    invoice.sentAt = invoice.sentAt || new Date();
     invoice.status = invoice.dueDate < today ? 'overdue' : 'sent';
+    await mirrorSentInvoice(invoice, userId, session);
     await invoice.save({ session });
     return invoice;
   });
